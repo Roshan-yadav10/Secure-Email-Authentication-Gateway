@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Email Authentication Header Analyzer</title>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --card:#f4f5f7; --pass:#15803d; --fail:#b91c1c; --warn:#a16207; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181d; --fg:#e8e8e8; --card:#23262d; --pass:#4ade80; --fail:#f87171; --warn:#facc15; } }
+  body { font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); max-width:780px; margin:2rem auto; padding:0 1rem; }
+  textarea { width:100%; height:200px; font:12px monospace; background:var(--card); color:var(--fg); border:1px solid #8884; border-radius:6px; padding:8px; box-sizing:border-box; }
+  button { margin:.6rem 0; padding:.5rem 1.2rem; font-size:15px; cursor:pointer; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border-radius:6px; }
+  td, th { padding:.45rem .7rem; text-align:left; border-bottom:1px solid #8883; }
+  .pass { color:var(--pass); font-weight:600; } .fail { color:var(--fail); font-weight:600; } .none { color:var(--warn); font-weight:600; }
+  ul { padding-left:1.2rem; } .note { color:var(--warn); }
+</style>
+</head>
+<body>
+<h1>Email Authentication Analyzer</h1>
+<p>Paste raw message headers. Parsing runs entirely in your browser; nothing is uploaded.</p>
+<textarea id="input" placeholder="Authentication-Results: mx.example.net; spf=pass ...&#10;From: ..."></textarea><br>
+<button id="go">Analyze</button>
+<div id="out"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// Unfold continuation lines, then collect headers into a name -> [values] map.
+function parseHeaders(raw) {
+  const headers = {};
+  raw.replace(/\r?\n[ \t]+/g, ' ').split(/\r?\n/).forEach(line => {
+    const i = line.indexOf(':');
+    if (i > 0) (headers[line.slice(0, i).toLowerCase()] ||= []).push(line.slice(i + 1).trim());
+  });
+  return headers;
+}
+
+const domainOf = v => ((v || '').match(/@([\w.-]+)/) || [])[1]?.toLowerCase() || '';
+// Naive organizational domain; real deployments should consult the Public Suffix List.
+const orgDomain = d => d.split('.').slice(-2).join('.');
+const aligned = (a, b) => !!a && !!b && orgDomain(a) === orgDomain(b);
+
+function analyze(raw) {
+  const h = parseHeaders(raw);
+  const results = {};
+  (h['authentication-results'] || []).forEach(ar => {
+    for (const [, mech, res] of ar.matchAll(/\b(spf|dkim|dmarc)=(\w+)/gi))
+      results[mech.toLowerCase()] ??= res.toLowerCase();
+  });
+  if (!results.spf && h['received-spf']) results.spf = h['received-spf'][0].split(/\s/)[0].toLowerCase();
+
+  const fromDom = domainOf((h['from'] || [])[0]);
+  const rpDom = domainOf((h['return-path'] || [])[0]);
+  const sigs = (h['dkim-signature'] || []).map(s => ({
+    d: (s.match(/\bd=([^;\s]+)/) || [])[1] || '', s: (s.match(/\bs=([^;\s]+)/) || [])[1] || '',
+    a: (s.match(/\ba=([^;\s]+)/) || [])[1] || ''
+  }));
+  const spfAligned = aligned(fromDom, rpDom);
+  const dkimAligned = sigs.some(s => aligned(fromDom, s.d));
+  const dmarcPass = (results.spf === 'pass' && spfAligned) || (results.dkim === 'pass' && dkimAligned);
+
+  const notes = [];
+  if (!Object.keys(results).length) notes.push('No Authentication-Results header found.');
+  if (results.spf === 'pass' && !spfAligned) notes.push('SPF passed but is not aligned with the From: domain.');
+  if (results.dkim === 'pass' && !dkimAligned) notes.push('DKIM passed but d= is not aligned with the From: domain.');
+  if (sigs.some(s => /sha1/i.test(s.a))) notes.push('A signature uses rsa-sha1, which is deprecated; use rsa-sha256.');
+  if (results.dmarc && results.dmarc !== 'pass' && dmarcPass) notes.push('Receiver reported DMARC failure although alignment looks correct; check DNS records.');
+  return { results, fromDom, rpDom, sigs, spfAligned, dkimAligned, dmarcPass, notes };
+}
+
+const badge = v => `<span class="${v === 'pass' ? 'pass' : v ? 'fail' : 'none'}">${esc(v || 'not found')}</span>`;
+const yesNo = b => `<span class="${b ? 'pass' : 'fail'}">${b ? 'yes' : 'no'}</span>`;
+
+$('go').onclick = () => {
+  const r = analyze($('input').value);
+  $('out').innerHTML = `
+    <table>
+      <tr><th>Check</th><th>Result</th></tr>
+      <tr><td>SPF (receiver)</td><td>${badge(r.results.spf)}</td></tr>
+      <tr><td>DKIM (receiver)</td><td>${badge(r.results.dkim)}</td></tr>
+      <tr><td>DMARC (receiver)</td><td>${badge(r.results.dmarc)}</td></tr>
+      <tr><td>From domain</td><td>${esc(r.fromDom) || '-'}</td></tr>
+      <tr><td>Return-Path domain</td><td>${esc(r.rpDom) || '-'}</td></tr>
+      <tr><td>SPF aligned with From</td><td>${yesNo(r.spfAligned)}</td></tr>
+      <tr><td>DKIM aligned with From</td><td>${yesNo(r.dkimAligned)}</td></tr>
+      <tr><td><b>DMARC would pass</b></td><td>${yesNo(r.dmarcPass)}</td></tr>
+      <tr><td>DKIM signatures</td><td>${r.sigs.map(s => `d=${esc(s.d)} s=${esc(s.s)}`).join('<br>') || '-'}</td></tr>
+    </table>
+    <ul>${r.notes.map(n => `<li class="note">${esc(n)}</li>`).join('')}</ul>`;
+};
+</script>
+</body>
+</html>
